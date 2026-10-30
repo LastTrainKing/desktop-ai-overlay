@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 打包产物
+build/
+dist/
+*.spec
+
+# 运行期产物（真实状态在 %APPDATA%\DesktopAIOverlay）
+*.log
+@AutomationLog.txt
+state.json
+
+# 编辑器
+.idea/
+.vscode/
+*.swp
+.DS_Store
