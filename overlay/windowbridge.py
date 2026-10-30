@@ -1,7 +1,10 @@
-"""豆包桥接：通过 Windows UI Automation 读取对话、通过模拟输入发送消息。
+"""窗口镜像桥：接管"已经在跑、已经登录"的 AI 客户端，不新建会话、不要登录。
 
-豆包是原生 Chromium 外壳，没有插件接口，所以只能"从外部看、从外部敲"：
-读走 UIA 的 TextPattern，写走剪贴板 + 键盘注入。豆包本体完全不动。
+读：UI Automation 的 TextPattern 取整页文本，比对前后差异得到新回复。
+写：切前台 → 点输入区 → 粘贴 → **写后校验** → 回车。
+
+写后校验是关键：粘贴后重新读文本，确认刚才那句话真的落进了输入框，
+否则 Ctrl+Z 撤销并报错。这样即使落点偏了，也不会把内容发到错误的地方。
 """
 
 from __future__ import annotations
@@ -19,7 +22,7 @@ try:
     import uiautomation as auto
     auto.SetGlobalSearchTimeout(2)
     HAS_UIA = True
-except Exception:  # 没装 uiautomation 时降级为"仅检测窗口"
+except Exception:
     HAS_UIA = False
 
 user32 = ctypes.WinDLL("user32", use_last_error=True)
@@ -47,15 +50,20 @@ class _INPUT(ctypes.Structure):
 MOUSEEVENTF_LEFTDOWN = 0x0002
 MOUSEEVENTF_LEFTUP = 0x0004
 KEYEVENTF_KEYUP = 0x0002
-VK_CONTROL = 0x11
-VK_RETURN = 0x0D
-VK_V = 0x56
+VK_CONTROL, VK_RETURN, VK_V, VK_Z = 0x11, 0x0D, 0x56, 0x5A
 
 
 def _key(vk: int, up: bool = False):
     inp = _INPUT(type=1)
     inp.ki = _KEYBDINPUT(vk, 0, KEYEVENTF_KEYUP if up else 0, 0, None)
     user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(_INPUT))
+
+
+def _combo(mod: int, vk: int):
+    _key(mod)
+    _key(vk)
+    _key(vk, up=True)
+    _key(mod, up=True)
 
 
 def _click(x: int, y: int):
@@ -68,7 +76,7 @@ def _click(x: int, y: int):
         time.sleep(0.03)
 
 
-def set_clipboard(text: str):
+def set_clipboard(text: str) -> bool:
     for _ in range(4):
         try:
             win32clipboard.OpenClipboard()
@@ -85,25 +93,45 @@ def set_clipboard(text: str):
     return False
 
 
-class DoubaoBridge:
-    WINDOW_NAME = "豆包"
-    WINDOW_CLASS = "Chrome_WidgetWin_1"
+# 每个客户端一个配置：进程名 + 输入区落点比例（相对窗口）
+PROFILES = {
+    "workbuddy": {"proc": "WorkBuddyAI.exe", "class": "Chrome_WidgetWin_1",
+                  "input": (0.49, 0.85), "label": "WorkBuddy"},
+    "doubao": {"proc": "Doubao.exe", "class": "Chrome_WidgetWin_1",
+               "input": (0.60, 0.91), "label": "豆包"},
+    "dsh": {"proc": "DeepSeek Harness.exe", "class": "Chrome_WidgetWin_1",
+            "input": (0.55, 0.90), "label": "DSH"},
+}
 
-    def __init__(self):
-        self._win = None
+
+class WindowBridge:
+    def __init__(self, key: str):
+        self.key = key
+        self.cfg = PROFILES[key]
         self._hwnd = None
+        self._ctrl = None
 
     # -- 发现 --------------------------------------------------------------
-    def find(self) -> int | None:
+    def find(self):
+        import psutil
         found = []
 
         def cb(h, _):
-            if win32gui.IsWindowVisible(h) and win32gui.GetWindowText(h) == self.WINDOW_NAME:
-                found.append(h)
+            if not win32gui.IsWindowVisible(h):
+                return True
+            if win32gui.GetClassName(h) != self.cfg["class"]:
+                return True
+            _, pid = win32process.GetWindowThreadProcessId(h)
+            try:
+                if psutil.Process(pid).name().lower() == self.cfg["proc"].lower():
+                    found.append(h)
+            except Exception:
+                pass
             return True
 
         win32gui.EnumWindows(cb, None)
         self._hwnd = found[0] if found else None
+        self._ctrl = None
         return self._hwnd
 
     @property
@@ -119,29 +147,28 @@ class DoubaoBridge:
         h = self.hwnd
         return win32gui.GetWindowRect(h) if h else None
 
-    def _control(self):
-        if not HAS_UIA:
+    def _root(self):
+        if not HAS_UIA or not self.hwnd:
             return None
-        if self._win is None:
-            self._win = auto.WindowControl(searchDepth=1, ClassName=self.WINDOW_CLASS,
-                                           Name=self.WINDOW_NAME)
-        if not self._win.Exists(1):
-            self._win = None
-            return None
-        return self._win
+        if self._ctrl is None:
+            try:
+                self._ctrl = auto.ControlFromHandle(self.hwnd)
+            except Exception:
+                return None
+        return self._ctrl
 
     # -- 读 ----------------------------------------------------------------
     def read_text(self) -> str:
-        win = self._control()
-        if win is None:
+        root = self._root()
+        if root is None:
             return ""
         try:
-            doc = win.DocumentControl(searchDepth=14)
+            doc = root.DocumentControl(searchDepth=14)
             if not doc.Exists(1):
                 return ""
-            tp = doc.GetTextPattern()
-            return tp.DocumentRange.GetText(-1) or ""
+            return doc.GetTextPattern().DocumentRange.GetText(-1) or ""
         except Exception:
+            self._ctrl = None
             return ""
 
     # -- 写 ----------------------------------------------------------------
@@ -152,9 +179,9 @@ class DoubaoBridge:
         try:
             if win32gui.IsIconic(h):
                 win32gui.ShowWindow(h, win32con.SW_RESTORE)
-            fg = win32gui.GetForegroundWindow()
-            if fg == h:
+            if win32gui.GetForegroundWindow() == h:
                 return True
+            fg = win32gui.GetForegroundWindow()
             t1 = win32process.GetWindowThreadProcessId(fg)[0]
             t2 = win32process.GetCurrentThreadId()
             try:
@@ -174,48 +201,46 @@ class DoubaoBridge:
         except Exception:
             return False
 
-    def _input_point(self):
-        """豆包输入区在右侧主区底部。按窗口比例估算，避开左侧会话栏。"""
+    def input_point(self):
         r = self.rect()
         if not r:
             return None
         left, top, right, bottom = r
         w, h = right - left, bottom - top
-        return int(left + w * 0.70), int(bottom - h * 0.075)
+        rx, ry = self.cfg["input"]
+        return int(left + w * rx), int(top + h * ry)
 
     def send(self, text: str) -> tuple[bool, str]:
         if not self.hwnd:
-            return False, "未找到豆包窗口，请先启动豆包"
+            return False, f"{self.cfg['label']} 未运行，请先打开它"
         if not set_clipboard(text):
             return False, "写入剪贴板失败"
         if not self.focus():
-            return False, "无法将豆包窗口切到前台（可能被全屏程序占用）"
-        pt = self._input_point()
+            return False, f"无法把 {self.cfg['label']} 切到前台（可能被全屏程序占用）"
+
+        before = self.read_text()
+        pt = self.input_point()
         if not pt:
-            return False, "无法计算输入框位置"
+            return False, "无法计算输入区位置"
         _click(*pt)
-        time.sleep(0.2)
-        _key(VK_CONTROL)
-        _key(VK_V)
-        _key(VK_V, up=True)
-        _key(VK_CONTROL, up=True)
-        time.sleep(0.35)
+        time.sleep(0.25)
+        _combo(VK_CONTROL, VK_V)
+        time.sleep(0.45)
+
+        # 写后校验：确认文字真的进了输入区
+        after = self.read_text()
+        marker = text.strip()[:12]
+        if marker and marker not in after:
+            _combo(VK_CONTROL, VK_Z)
+            return False, ("没能把内容写进输入框（落点可能被界面变化影响）。"
+                           "已撤销，未发送。可尝试把窗口最大化后重试。")
+
         _key(VK_RETURN)
         _key(VK_RETURN, up=True)
+        time.sleep(0.1)
         return True, ""
 
-
-def probe() -> dict:
-    """供界面显示连接状态。"""
-    b = DoubaoBridge()
-    ok = b.is_running()
-    return {
-        "running": ok,
-        "uia": HAS_UIA,
-        "rect": b.rect() if ok else None,
-        "text_len": len(b.read_text()) if ok and HAS_UIA else 0,
-    }
-
-
-if __name__ == "__main__":
-    print(probe())
+    def status(self) -> dict:
+        ok = self.is_running()
+        return {"running": ok, "uia": HAS_UIA, "rect": self.rect() if ok else None,
+                "label": self.cfg["label"]}

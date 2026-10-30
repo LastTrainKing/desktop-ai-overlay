@@ -139,7 +139,13 @@ class Controller(QObject):
 
     def _apply_target_ui(self):
         meta = next((t for t in TARGETS if t["key"] == self.store.active), TARGETS[0])
-        self.chat.set_target(meta["name"], meta["desc"])
+        from .adapters import probe_target
+        try:
+            info = probe_target(meta["key"])
+            sub = info["detail"]
+        except Exception:
+            sub = meta["desc"]
+        self.chat.set_target(meta["name"], sub)
 
     def _build_adapter(self):
         if self.adapter is not None:
@@ -148,10 +154,6 @@ class Controller(QObject):
             self.adapter = None
         prof = self.store.profile()
         cwd = str(self.store.data.get("cwd") or os.getcwd())
-        # DSH 的模型密钥通过环境变量注入，避免落进子进程命令行
-        key = self.store.data.get("settings", {}).get("deepseek_api_key")
-        if self.store.active == "dsh" and key:
-            os.environ["DEEPSEEK_API_KEY"] = key
         self.adapter = build_adapter(self.store.active, cwd, prof.get("session_id"))
         self.adapter.chunk.connect(self.chat.update_stream)
         self.adapter.done.connect(self._on_done)
@@ -274,12 +276,8 @@ class Controller(QObject):
         dlg.adjustSize()
         scr = QGuiApplication.primaryScreen().availableGeometry()
         dlg.move(scr.center() - dlg.rect().center())
-        if dlg.exec() == QDialog.Accepted:
-            self._build_adapter()
-            self.chat.add_message(
-                "assistant",
-                "设置已保存。当前通道已重新连接，可以直接发消息了。",
-            )
+        dlg.exec()
+        self._build_adapter()
 
     def _ball_menu(self, pos: QPoint):
         self._menu().exec(pos)

@@ -58,33 +58,36 @@ class Adapter(QObject):
 # --------------------------------------------------------------------------
 
 
-class DoubaoAdapter(Adapter):
-    name = "doubao"
+class MirrorAdapter(Adapter):
+    """接管已经在跑的客户端窗口：不新建会话、不要登录、不改动原程序。"""
+
+    name = "mirror"
 
     POLL_MS = 700
-    QUIET_DONE_S = 2.6
-    TIMEOUT_S = 90
+    QUIET_DONE_S = 2.8
+    TIMEOUT_S = 120
 
-    def __init__(self):
+    def __init__(self, target: str):
         super().__init__()
-        from .doubao import DoubaoBridge
-        self.bridge = DoubaoBridge()
+        from .windowbridge import WindowBridge
+        self.target = target
+        self.bridge = WindowBridge(target)
         self._baseline = ""
         self._acc = ""
         self._last_change = 0.0
         self._started = 0.0
+        self._waiting = False
         self._poll = QTimer(self)
         self._poll.setInterval(self.POLL_MS)
         self._poll.timeout.connect(self._tick)
-        self._waiting = False
 
     def start(self) -> None:
-        # 不主动报错：豆包没开时也允许先看历史，发送时再提示
+        # 不做任何事：客户端没开也允许先看历史，发送时再提示
         self._waiting = False
 
     def send(self, text: str) -> None:
         if not self.bridge.is_running():
-            self.failed.emit("豆包未运行，无法发送。请先打开豆包。")
+            self.failed.emit(f"{self.bridge.cfg['label']} 没有在运行。先打开它，再回来发送。")
             return
         self._baseline = self.bridge.read_text()
         self._acc = ""
@@ -101,27 +104,22 @@ class DoubaoAdapter(Adapter):
         if not self._waiting:
             return
         now = time.monotonic()
-        text = self.bridge.read_text()
-        delta = _delta(self._baseline, text)
-        if delta != self._acc:
-            if len(delta) > len(self._acc):
-                self._acc = delta
-                self._last_change = now
-                self.chunk.emit(delta)
+        delta = _delta(self._baseline, self.bridge.read_text())
+        if len(delta) > len(self._acc):
+            self._acc = delta
+            self._last_change = now
+            self.chunk.emit(delta)
         if self._acc and (now - self._last_change) > self.QUIET_DONE_S:
-            self._finish()
+            self._poll.stop()
+            self._waiting = False
+            self.done.emit()
         elif now - self._started > self.TIMEOUT_S:
             self._poll.stop()
             self._waiting = False
             if self._acc:
                 self.done.emit()
             else:
-                self.failed.emit("等待豆包回复超时。可能窗口被遮挡，或豆包未响应。")
-
-    def _finish(self):
-        self._poll.stop()
-        self._waiting = False
-        self.done.emit()
+                self.failed.emit("等待回复超时。可能窗口被遮挡，或对方没有响应。")
 
     def cancel(self):
         self._poll.stop()
@@ -459,24 +457,20 @@ class MockAdapter(Adapter):
 
 
 def build_adapter(target: str, cwd: str, session_id: str | None = None) -> Adapter:
-    if target == "workbuddy":
+    # 默认全部走"接管已登录窗口"，不需要任何登录或密钥
+    if target == "workbuddy" and os.environ.get("OVERLAY_USE_ACP") == "1":
         return AcpAdapter(cwd, session_id)
-    if target == "dsh":
-        return DshAdapter(cwd, session_id)
-    if target == "doubao":
-        return DoubaoAdapter()
+    if target in ("workbuddy", "doubao", "dsh"):
+        return MirrorAdapter(target)
     return MockAdapter(target)
 
 
 def probe_target(target: str) -> dict:
-    """给界面用的连接体检，全部是本地检查，不触发任何 AI 调用。"""
-    if target == "workbuddy":
-        return {"ok": WB_EXE.exists() and WB_CLI.exists(),
-                "detail": "ACP 常驻会话" if WB_EXE.exists() else "未安装"}
-    if target == "dsh":
-        return {"ok": DSH_EXE.exists(), "detail": "headless 事件流"}
-    if target == "doubao":
-        from .doubao import probe as dp
-        p = dp()
-        return {"ok": p["running"], "detail": "窗口已就绪" if p["running"] else "豆包未启动"}
+    """给界面用的连接体检，纯本地检查，不触发任何 AI 调用。"""
+    if target in ("workbuddy", "doubao", "dsh"):
+        from .windowbridge import WindowBridge
+        st = WindowBridge(target).status()
+        label = st["label"]
+        return {"ok": st["running"],
+                "detail": f"{label} 窗口已接管" if st["running"] else f"{label} 未启动"}
     return {"ok": True, "detail": "演示通道"}

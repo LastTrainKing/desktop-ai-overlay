@@ -629,22 +629,19 @@ class InputBox(FramelessCard):
 
 
 class SettingsDialog(QDialog):
-    """三个目标的连接体检 + 凭据录入。不弹网页、不跳转，就地解决。"""
+    """三个通道的连接体检。全部是接管窗口，不需要登录也不需要密钥。"""
 
     def __init__(self, store, parent=None):
         super().__init__(parent)
-        from .adapters import probe_target
         from .core import TARGETS
 
         self.store = store
-        self.setWindowTitle("连接设置")
+        self.setWindowTitle("连接状态")
         self.setWindowFlag(Qt.WindowStaysOnTopHint, True)
-        self.setFixedWidth(480)
+        self.setFixedWidth(460)
         self.setStyleSheet(
             "QDialog{background:#14161C;}"
             f"QLabel{{color:{theme.TEXT};}}"
-            "QLineEdit{background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.12);"
-            "border-radius:8px;padding:7px 10px;color:#E9ECF3;}"
             "QPushButton{background:rgba(255,255,255,0.08);border:none;border-radius:8px;"
             "padding:7px 16px;color:#E9ECF3;}"
             "QPushButton:hover{background:rgba(255,255,255,0.14);}"
@@ -652,80 +649,57 @@ class SettingsDialog(QDialog):
 
         root = QVBoxLayout(self)
         root.setContentsMargins(22, 20, 22, 18)
-        root.setSpacing(12)
+        root.setSpacing(11)
 
-        title = QLabel("三个通道的连接状态")
+        title = QLabel("三个客户端")
         title.setStyleSheet(f"color:{theme.TEXT};font-size:15px;font-weight:600;")
         root.addWidget(title)
 
+        self._rows = {}
         for t in TARGETS:
             if t["key"] == "demo":
                 continue
-            info = probe_target(t["key"])
-            ready = info["ok"]
-            detail_text = info["detail"]
-            if t["key"] == "dsh":
-                ready = bool(store.data.get("settings", {}).get("deepseek_api_key"))
-                detail_text += " · 已就绪" if ready else " · 需填密钥"
-            elif t["key"] == "workbuddy":
-                ready = False
-                detail_text += " · 需登录一次"
             row = QHBoxLayout()
             dot = QLabel("●")
-            dot.setStyleSheet(f"color:{'#5ED6A0' if ready else '#E0A34C'};font-size:11px;")
+            dot.setStyleSheet("font-size:11px;")
             name = QLabel(t["name"])
             name.setFixedWidth(96)
             name.setStyleSheet(f"color:{theme.TEXT};font-size:13px;")
-            detail = QLabel(detail_text)
+            detail = QLabel("检测中…")
             detail.setStyleSheet(f"color:{theme.TEXT_MUTED};font-size:12px;")
             row.addWidget(dot)
             row.addWidget(name)
             row.addWidget(detail, 1)
             root.addLayout(row)
+            self._rows[t["key"]] = (dot, detail)
 
         line = QWidget()
         line.setFixedHeight(1)
         line.setStyleSheet("background:rgba(255,255,255,0.08);")
         root.addWidget(line)
 
-        tip = QLabel("DSH 需要一次模型密钥；WorkBuddy 需要在终端里登录一次。填好保存即可，之后一直有效。")
+        tip = QLabel("三个通道都是接管你已登录的客户端窗口：不新建会话、不需要登录、"
+                     "不改动原程序。发送前会校验内容是否落进输入框，写错会自动撤销。")
         tip.setWordWrap(True)
-        tip.setStyleSheet(f"color:{theme.TEXT_MUTED};font-size:12px;line-height:160%;")
+        tip.setStyleSheet(f"color:{theme.TEXT_MUTED};font-size:12px;")
         root.addWidget(tip)
-
-        key_row = QHBoxLayout()
-        key_label = QLabel("DSH Key")
-        key_label.setFixedWidth(70)
-        key_label.setStyleSheet(f"color:{theme.TEXT};font-size:13px;")
-        self.key_edit = QLineEdit()
-        self.key_edit.setEchoMode(QLineEdit.Password)
-        self.key_edit.setPlaceholderText("sk-…（DeepSeek API Key）")
-        self.key_edit.setText(store.data.get("settings", {}).get("deepseek_api_key", ""))
-        key_row.addWidget(key_label)
-        key_row.addWidget(self.key_edit, 1)
-        root.addLayout(key_row)
-
-        wb_tip = QLabel("WorkBuddy 登录：在终端执行  codebuddy  然后输入 /login")
-        wb_tip.setStyleSheet(f"color:{theme.TEXT_FAINT};font-size:11px;")
-        root.addWidget(wb_tip)
 
         btns = QHBoxLayout()
         btns.addStretch(1)
-        cancel = QPushButton("关闭")
-        cancel.clicked.connect(self.reject)
-        save = QPushButton("保存")
-        save.setStyleSheet(
-            f"QPushButton{{background:{theme.ACCENT};border:none;border-radius:8px;"
-            "padding:7px 18px;color:#fff;font-size:13px;}"
-            "QPushButton:hover{background:#5E9BFF;}"
-        )
-        save.clicked.connect(self._save)
-        btns.addWidget(cancel)
-        btns.addWidget(save)
+        refresh = QPushButton("重新检测")
+        refresh.clicked.connect(self.refresh)
+        close = QPushButton("关闭")
+        close.clicked.connect(self.reject)
+        btns.addWidget(refresh)
+        btns.addWidget(close)
         root.addLayout(btns)
 
-    def _save(self):
-        settings = self.store.data.setdefault("settings", {})
-        settings["deepseek_api_key"] = self.key_edit.text().strip()
-        self.store.save()
-        self.accept()
+        self.refresh()
+
+    def refresh(self):
+        from .adapters import probe_target
+        for key, (dot, detail) in self._rows.items():
+            info = probe_target(key)
+            dot.setStyleSheet(
+                f"color:{'#5ED6A0' if info['ok'] else '#7A8090'};font-size:11px;")
+            detail.setText(info["detail"])
